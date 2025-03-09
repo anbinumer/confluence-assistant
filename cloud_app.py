@@ -2,6 +2,8 @@ import streamlit as st
 import os
 import json
 import re
+import requests
+from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -24,21 +26,18 @@ else:
 # Create and cache the search index
 @st.cache_resource
 def create_search_index():
-    # In cloud environment, we'd download data here
-    if 'DOWNLOAD_ON_START' in st.secrets and st.secrets['DOWNLOAD_ON_START']:
-        with st.spinner("Downloading fresh Confluence data..."):
-            # Download code would go here
-            pass
+    # Download data from Confluence
+    documents_data = download_confluence_data()
     
-    # For now, let's use sample data
-    sample_data = [
-        {"title": "Sample Document 1", "text": "This is a sample document about learning technologies."},
-        {"title": "Sample Document 2", "text": "Canvas is a learning management system used at ACU."}
-    ]
+    if not documents_data:
+        # Fallback to sample data if download fails
+        documents_data = [
+            {"title": "Sample Document 1", "text": "This is a sample document about learning technologies.", "url": "#"},
+            {"title": "Sample Document 2", "text": "Canvas is a learning management system used at ACU.", "url": "#"}
+        ]
     
-    # Create documents and metadata
-    documents = [item["text"] for item in sample_data]
-    metadata = [{"title": item["title"], "url": "#"} for item in sample_data]
+    documents = [item["text"] for item in documents_data]
+    metadata = [{"title": item["title"], "url": item["url"]} for item in documents_data]
     
     # Create TF-IDF vectorizer
     vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
@@ -63,6 +62,44 @@ def search_documents(query, vectorizer, tfidf_matrix, documents, metadata, top_k
             })
     
     return results
+
+# Add this function to download Confluence data
+def download_confluence_data():
+    # API endpoint
+    content_url = f"{confluence_url}/wiki/rest/api/content"
+    
+    # Get pages from the space
+    response = requests.get(
+        f"{content_url}?spaceKey=LT&limit=100&expand=body.storage",
+        auth=(confluence_username, confluence_api_key)
+    )
+    
+    if response.status_code != 200:
+        st.error(f"Error accessing Confluence: {response.status_code}")
+        return []
+        
+    data = response.json()
+    pages = data.get('results', [])
+    
+    documents = []
+    for page in pages:
+        title = page.get('title', 'Untitled')
+        page_id = page.get('id', 'Unknown')
+        url = f"{confluence_url}/wiki/spaces/LT/pages/{page_id}"
+        
+        # Extract text content from HTML
+        html_content = page.get('body', {}).get('storage', {}).get('value', '')
+        soup = BeautifulSoup(html_content, 'html.parser')
+        text_content = soup.get_text()
+        
+        documents.append({
+            "title": title,
+            "text": text_content,
+            "url": url,
+            "id": page_id
+        })
+    
+    return documents
 
 # Main app
 def main():
