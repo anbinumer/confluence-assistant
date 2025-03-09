@@ -1,9 +1,9 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-import numpy as np
-from sentence_transformers import SentenceTransformer
 import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Page configuration
 st.set_page_config(page_title="Confluence Knowledge Assistant", page_icon="🧠", layout="wide")
@@ -78,9 +78,9 @@ def split_into_chunks(text, title, url, chunk_size=1000, overlap=200):
     
     return chunks
 
-# Load embeddings model and create search index
+# Create TF-IDF search index
 @st.cache_resource
-def create_embeddings_index():
+def create_search_index():
     # Download data
     documents_data = download_confluence_data()
     
@@ -91,34 +91,27 @@ def create_embeddings_index():
             {"title": "Sample 2", "text": "LICs can be enrolled in Canvas courses.", "url": "#"}
         ]
     
-    # Load embeddings model
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    # Create embeddings for all documents
+    # Create TF-IDF vectorizer
     documents = [item["text"] for item in documents_data]
-    embeddings = model.encode(documents)
+    vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
+    tfidf_matrix = vectorizer.fit_transform(documents)
     
-    return model, embeddings, documents_data
+    return vectorizer, tfidf_matrix, documents_data
 
-# Search function using embeddings
-def search_documents(query, model, embeddings, documents_data, top_k=5):
-    # Create query embedding
-    query_embedding = model.encode([query])[0]
+# Search function
+def search_documents(query, vectorizer, tfidf_matrix, documents_data, top_k=5):
+    # Transform query to TF-IDF vector
+    query_vector = vectorizer.transform([query])
     
-    # Calculate similarity to all documents
-    similarities = []
-    for doc_embedding in embeddings:
-        similarity = np.dot(query_embedding, doc_embedding) / (
-            np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
-        )
-        similarities.append(similarity)
+    # Calculate similarity
+    similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
     
-    # Find top matches
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    # Get top matches
+    top_indices = similarities.argsort()[-top_k:][::-1]
     
     results = []
     for idx in top_indices:
-        if similarities[idx] > 0.2:  # Minimum relevance threshold
+        if similarities[idx] > 0.1:  # Minimum relevance threshold
             results.append({
                 "text": documents_data[idx]["text"],
                 "title": documents_data[idx]["title"],
@@ -135,53 +128,36 @@ def generate_answer(query, results):
     
     # Extract most relevant content
     relevant_texts = [r["text"] for r in results]
-    combined_text = " ".join(relevant_texts)
     
-    # Find paragraphs that might contain answers
-    paragraphs = re.split(r'\n+', combined_text)
+    # Split into paragraphs and find relevant ones
+    all_paragraphs = []
+    for text in relevant_texts:
+        paragraphs = re.split(r'\n+', text)
+        all_paragraphs.extend([p for p in paragraphs if len(p.strip()) > 30])
+    
+    # Find paragraphs with query terms
     query_words = set(re.findall(r'\b\w+\b', query.lower()))
+    query_words = {w for w in query_words if len(w) > 3}  # Only meaningful words
     
-    # Score paragraphs by relevance to query
-    scored_paragraphs = []
-    for para in paragraphs:
-        if len(para.strip()) < 30:
-            continue
-            
-        para_words = set(re.findall(r'\b\w+\b', para.lower()))
-        relevance = len(query_words.intersection(para_words)) / len(query_words) if query_words else 0
-        scored_paragraphs.append((para, relevance))
+    relevant_paragraphs = []
+    for para in all_paragraphs:
+        para_lower = para.lower()
+        matches = sum(1 for word in query_words if word in para_lower)
+        if matches > 0:
+            relevant_paragraphs.append((para, matches))
     
     # Sort by relevance
-    scored_paragraphs.sort(key=lambda x: x[1], reverse=True)
+    relevant_paragraphs.sort(key=lambda x: x[1], reverse=True)
     
-    # Construct answer from most relevant paragraphs
-    answer_parts = []
-    for para, score in scored_paragraphs[:3]:
-        if score > 0.1:  # Minimum relevance threshold
-            answer_parts.append(para)
-    
-    if answer_parts:
+    # Build answer from most relevant paragraphs
+    if relevant_paragraphs:
+        answer_parts = [p[0] for p in relevant_paragraphs[:3]]
         answer = "\n\n".join(answer_parts)
     else:
-        # Fallback to first paragraph of top result
-        answer = results[0]["text"].split("\n")[0]
-        
+        # Fallback to first paragraph
+        answer = all_paragraphs[0] if all_paragraphs else "No specific information found."
+    
     return answer
-
-# Format a document for display
-def format_document(doc):
-    # Clean up and format content for display
-    text = doc["text"]
-    
-    # Format paragraphs
-    paragraphs = re.split(r'\n+', text)
-    formatted_text = ""
-    
-    for para in paragraphs:
-        if len(para.strip()) > 0:
-            formatted_text += f"{para.strip()}\n\n"
-    
-    return formatted_text
 
 # Main app
 def main():
@@ -190,7 +166,7 @@ def main():
     
     # Initialize search index
     with st.spinner("Loading knowledge base..."):
-        model, embeddings, documents_data = create_embeddings_index()
+        vectorizer, tfidf_matrix, documents_data = create_search_index()
         st.success(f"Loaded {len(documents_data)} documents from Confluence")
     
     # Search interface
@@ -206,7 +182,7 @@ def main():
     
     if search_button and query:
         with st.spinner("Searching knowledge base..."):
-            results = search_documents(query, model, embeddings, documents_data, num_results)
+            results = search_documents(query, vectorizer, tfidf_matrix, documents_data, num_results)
             
             if not results:
                 st.warning("No relevant results found. Try rephrasing your question.")
@@ -228,11 +204,12 @@ def main():
             with st.expander(f"{i+1}. {result['title']} (Relevance: {result['similarity']:.2f})"):
                 st.markdown(f"**[View in Confluence]({result['url']})**")
                 
-                # Format and display content in a readable way
-                formatted_text = format_document(result)
-                
-                # Display in paragraphs
-                st.markdown(formatted_text)
+                # Format text into paragraphs for readability
+                paragraphs = re.split(r'\n+', result['text'])
+                for para in paragraphs:
+                    if len(para.strip()) > 0:
+                        st.markdown(para)
+                        st.markdown("")
 
 if __name__ == "__main__":
     main()
